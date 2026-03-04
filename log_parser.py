@@ -208,78 +208,128 @@ def _json_obj_to_entry(obj: dict) -> LogEntry:
     return LogEntry(timestamp=ts, level=level, message=message, source=source, extra=extra, raw=json.dumps(obj))
 
 
-def parse_text_log(content: str) -> list[LogEntry]:
-    """Parse a plain-text log file using regex heuristics."""
+def parse_line(line: str, raw: str) -> LogEntry:
+    """Parse a single plain-text log line using regex heuristics."""
+    ts = None
+    ts_str = None
+    for pattern in TS_PATTERNS:
+        m = re.search(pattern, line)
+        if m:
+            ts_str = m.group(1)
+            ts = parse_timestamp(ts_str)
+            if ts:
+                break
+
+    level = "INFO"
+    level_match = LEVEL_PATTERN.search(line)
+    if level_match:
+        level = level_match.group(1).upper()
+
+    working = line
+    if ts_str:
+        working = working.replace(ts_str, "", 1).strip()
+
+    bracketed = re.findall(r"\[([^\]]+)\]", working)
+    source = None
+    for token in bracketed:
+        token = token.strip()
+        if LEVEL_PATTERN.fullmatch(token):
+            continue
+        if not re.match(r"^\d+$", token):
+            source = token
+            break
+
+    message = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", working).strip()
+    message = re.sub(r"^[\s|:,\-–]+", "", message).strip()
+    if not message:
+        message = working
+
+    return LogEntry(timestamp=ts, level=level, message=message, source=source, raw=raw)
+
+
+def parse_mixed_log(content: str) -> list[LogEntry]:
+    """Parse a file where each line can be JSON or plain text."""
     entries = []
     for line in content.splitlines():
         raw = line
-        line = line.strip()
-        if not line:
+        stripped = line.strip()
+        if not stripped:
             continue
-
-        # Extract timestamp
-        ts = None
-        ts_str = None
-        for pattern in TS_PATTERNS:
-            m = re.search(pattern, line)
-            if m:
-                ts_str = m.group(1)
-                ts = parse_timestamp(ts_str)
-                if ts:
-                    break
-
-        # Extract level
-        level = "INFO"
-        level_match = LEVEL_PATTERN.search(line)
-        if level_match:
-            level = level_match.group(1).upper()
-
-        # Remove timestamp from working copy
-        working = line
-        if ts_str:
-            working = working.replace(ts_str, "", 1).strip()
-
-        # Try to extract bracketed tokens: [LEVEL] [Source] Message
-        bracketed = re.findall(r"\[([^\]]+)\]", working)
-        source = None
-        for token in bracketed:
-            token = token.strip()
-            if LEVEL_PATTERN.fullmatch(token):
-                continue  # that's the level badge, skip
-            if not re.match(r"^\d+$", token):
-                source = token
-                break
-
-        # Extract message: remove all leading [token] groups then clean up
-        message = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", working).strip()
-        # Also strip leading separators
-        message = re.sub(r"^[\s|:,\-–]+", "", message).strip()
-        if not message:
-            message = working  # fallback
-
-        entries.append(LogEntry(timestamp=ts, level=level, message=message, source=source, raw=raw))
-
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+                entries.append(_json_obj_to_entry(obj))
+                continue
+            except json.JSONDecodeError:
+                pass
+        entries.append(parse_line(stripped, raw))
     return entries
 
 
-def parse_file(path: Path) -> list[LogEntry]:
-    content = path.read_text(encoding="utf-8", errors="replace")
-    suffix = path.suffix.lower()
+def parse_text_line(line: str, raw: str) -> LogEntry:
+    """Parse a single plain-text log line."""
+    ts = None
+    ts_str = None
+    for pattern in TS_PATTERNS:
+        m = re.search(pattern, line)
+        if m:
+            ts_str = m.group(1)
+            ts = parse_timestamp(ts_str)
+            if ts:
+                break
 
-    if suffix == ".json":
+    level = "INFO"
+    level_match = LEVEL_PATTERN.search(line)
+    if level_match:
+        level = level_match.group(1).upper()
+
+    working = line
+    if ts_str:
+        working = working.replace(ts_str, "", 1).strip()
+
+    bracketed = re.findall(r"\[([^\]]+)\]", working)
+    source = None
+    for token in bracketed:
+        token = token.strip()
+        if LEVEL_PATTERN.fullmatch(token):
+            continue
+        if not re.match(r"^\d+$", token):
+            source = token
+            break
+
+    message = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", working).strip()
+    message = re.sub(r"^[\s|:,\-–]+", "", message).strip()
+    if not message:
+        message = working
+
+    return LogEntry(timestamp=ts, level=level, message=message, source=source, raw=raw)
+
+
+def parse_file(path: Path) -> list[LogEntry]:
+    """Read the file and parse each line individually as JSON or plain text."""
+    content = path.read_text(encoding="utf-8", errors="replace")
+
+    # Pure .json file — handle as a whole (array or NDJSON)
+    if path.suffix.lower() == ".json":
         return parse_json_log(content)
-    elif suffix in (".log", ".txt", ""):
-        # Peek: if first non-empty line looks like JSON, treat as NDJSON
-        first = next((l.strip() for l in content.splitlines() if l.strip()), "")
-        if first.startswith("{"):
-            return parse_json_log(content)
-        return parse_text_log(content)
-    else:
-        # Best effort for unknown extensions
-        first = next((l.strip() for l in content.splitlines() if l.strip()), "")
-        if first.startswith("{") or first.startswith("["):
-            return parse_json_log(content)
-        return parse_text_log(content)
+
+    # Everything else: decide per line
+    entries = []
+    for line in content.splitlines():
+        raw = line
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+                entries.append(_json_obj_to_entry(obj))
+                continue
+            except json.JSONDecodeError:
+                pass  # not valid JSON — fall through to text parser
+        entries.append(parse_text_line(stripped, raw))
+
+    return entries
 
 
 # ── Formatter ─────────────────────────────────────────────────────────────────
