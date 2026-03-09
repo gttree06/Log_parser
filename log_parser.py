@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """
-log_parser.py — Parse and format JSON and plain-text log files into a clean, uniform view.
+log_parser.py — Parse and format mixed JSON/text log files.
 
 Usage:
-    python log_parser.py <logfile> [options]
-
-Options:
-    --level LEVEL       Filter by log level (e.g. ERROR, WARN, INFO, DEBUG)
-    --since DATETIME    Show logs after this time (e.g. "2024-01-15 10:00:00")
-    --until DATETIME    Show logs before this time (e.g. "2024-01-15 18:00:00")
-    --no-color          Disable colored output
-    --summary           Show only the summary, not individual log lines
-    --output FILE       Write formatted output to a file instead of stdout
-
-Examples:
-    python log_parser.py app.log
-    python log_parser.py app.json --level ERROR
-    python log_parser.py app.log --since "2024-01-15 10:00:00" --level WARN
-    python log_parser.py app.log --output clean.txt --no-color
+    python log_parser.py <logfile>
+    python log_parser.py <logfile> --level WARN
+    python log_parser.py <logfile> --since "2024-01-15 10:00:00"
 """
 
 import json
@@ -29,407 +17,205 @@ from pathlib import Path
 from collections import Counter
 
 
-# ── ANSI color codes ──────────────────────────────────────────────────────────
+# ── Colors ────────────────────────────────────────────────────────────────────
 
 COLORS = {
-    "reset":   "\033[0m",
-    "bold":    "\033[1m",
-    "dim":     "\033[2m",
-    "red":     "\033[91m",
-    "yellow":  "\033[93m",
-    "green":   "\033[92m",
-    "blue":    "\033[94m",
-    "cyan":    "\033[96m",
-    "magenta": "\033[95m",
-    "white":   "\033[97m",
-    "gray":    "\033[90m",
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[91m", "yellow": "\033[93m", "green": "\033[92m",
+    "blue": "\033[94m", "cyan": "\033[96m", "magenta": "\033[95m",
+    "white": "\033[97m", "gray": "\033[90m",
 }
 
 LEVEL_COLORS = {
-    "ERROR":    "red",
-    "CRITICAL": "red",
-    "FATAL":    "red",
-    "WARN":     "yellow",
-    "WARNING":  "yellow",
-    "INFO":     "green",
-    "DEBUG":    "blue",
-    "TRACE":    "cyan",
+    "ERROR": "red", "CRITICAL": "red", "FATAL": "red",
+    "WARN": "yellow", "WARNING": "yellow",
+    "INFO": "green", "DEBUG": "blue", "TRACE": "cyan",
 }
 
 USE_COLOR = True
 
-
-def c(text, *color_names):
-    """Wrap text in ANSI color codes (no-op if color disabled)."""
+def c(text, *names):
     if not USE_COLOR:
         return text
-    codes = "".join(COLORS.get(name, "") for name in color_names)
-    return f"{codes}{text}{COLORS['reset']}"
+    return "".join(COLORS.get(n, "") for n in names) + text + COLORS["reset"]
 
 
-# ── Log entry dataclass ───────────────────────────────────────────────────────
+# ── Parsing ───────────────────────────────────────────────────────────────────
 
-class LogEntry:
-    def __init__(self, timestamp=None, level=None, message=None, source=None, extra=None, raw=None):
-        self.timestamp: datetime | None = timestamp
-        self.level: str = (level or "INFO").upper()
-        self.message: str = message or ""
-        self.source: str | None = source
-        self.extra: dict = extra or {}
-        self.raw: str = raw or ""
-
-    def matches_level(self, filter_level: str) -> bool:
-        order = ["TRACE", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL", "FATAL"]
-        try:
-            entry_idx = order.index(self.level)
-            filter_idx = order.index(filter_level.upper())
-            return entry_idx >= filter_idx
-        except ValueError:
-            return self.level == filter_level.upper()
-
-    def matches_time(self, since=None, until=None) -> bool:
-        if self.timestamp is None:
-            return True  # can't filter what we don't have
-        if since and self.timestamp < since:
-            return False
-        if until and self.timestamp > until:
-            return False
-        return True
-
-
-# ── Parsers ───────────────────────────────────────────────────────────────────
-
-# Common timestamp patterns
 TS_PATTERNS = [
     r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
-    r"(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})",  # Apache style: 10/Jan/2024:13:00:00
-    r"(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})",   # Syslog style: Jan 15 13:00:00
+    r"(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})",
+    r"(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})",
 ]
 
-LEVEL_PATTERN = re.compile(
+TS_FORMATS = [
+    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+    "%d/%b/%Y:%H:%M:%S", "%b %d %H:%M:%S", "%b  %d %H:%M:%S",
+]
+
+LEVEL_RE = re.compile(
     r"\b(TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|CRITICAL|FATAL|SEVERE)\b",
     re.IGNORECASE
 )
 
-TS_FORMATS = [
-    "%Y-%m-%dT%H:%M:%S.%f%z",
-    "%Y-%m-%dT%H:%M:%S%z",
-    "%Y-%m-%dT%H:%M:%S.%f",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d %H:%M:%S.%f",
-    "%Y-%m-%d %H:%M:%S",
-    "%d/%b/%Y:%H:%M:%S",
-    "%b %d %H:%M:%S",
-    "%b  %d %H:%M:%S",
-]
 
-
-def parse_timestamp(ts_str: str) -> datetime | None:
-    ts_str = ts_str.strip().rstrip("Z")
+def parse_timestamp(s):
+    s = s.strip().rstrip("Z")
     for fmt in TS_FORMATS:
         try:
-            return datetime.strptime(ts_str, fmt)
+            return datetime.strptime(s, fmt)
         except ValueError:
-            continue
+            pass
     return None
 
 
-def parse_json_log(content: str) -> list[LogEntry]:
-    """Parse a file where each line (or the whole file) is JSON."""
-    entries = []
-    lines = content.strip().splitlines()
+def parse_line(raw):
+    """Identify and parse a single log line — JSON or plain text — into a dict."""
+    line = raw.strip()
 
-    # Try whole file as a JSON array first
-    try:
-        data = json.loads(content)
-        if isinstance(data, list):
-            for item in data:
-                entries.append(_json_obj_to_entry(item))
-            return entries
-    except json.JSONDecodeError:
-        pass
-
-    # Fall back to one JSON object per line (NDJSON)
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    # ── JSON ──
+    if line.startswith("{"):
         try:
             obj = json.loads(line)
-            entries.append(_json_obj_to_entry(obj))
+
+            ts = next((parse_timestamp(str(obj[k])) for k in
+                       ("timestamp","time","ts","@timestamp","datetime","date","created_at")
+                       if k in obj), None)
+
+            level = next((str(obj[k]).upper() for k in
+                          ("level","severity","log_level","lvl") if k in obj), "INFO")
+
+            message = next((str(obj[k]) for k in
+                            ("message","msg","text","body","log","event") if k in obj), str(obj))
+
+            source = next((str(obj[k]) for k in
+                           ("logger","source","service","module","name","component","app")
+                           if k in obj), None)
+
+            known = {"timestamp","time","ts","@timestamp","datetime","date","created_at",
+                     "level","severity","log_level","lvl","message","msg","text","body",
+                     "log","event","logger","source","service","module","name","component","app"}
+            extra = {k: v for k, v in obj.items() if k not in known}
+
+            return dict(ts=ts, level=level, message=message, source=source, extra=extra)
         except json.JSONDecodeError:
-            entries.append(LogEntry(message=line, level="INFO", raw=line))
+            pass  # fall through to text parsing
 
-    return entries
-
-
-def _json_obj_to_entry(obj: dict) -> LogEntry:
-    """Normalize a JSON log object to a LogEntry, handling various key conventions."""
-    if not isinstance(obj, dict):
-        return LogEntry(message=str(obj), raw=str(obj))
-
-    # Timestamp — try common key names
-    ts = None
-    for key in ("timestamp", "time", "ts", "@timestamp", "datetime", "date", "created_at"):
-        if key in obj:
-            ts = parse_timestamp(str(obj[key]))
-            break
-
-    # Level
-    level = "INFO"
-    for key in ("level", "severity", "log_level", "lvl", "type", "status"):
-        if key in obj:
-            level = str(obj[key]).upper()
-            break
-
-    # Message
-    message = ""
-    for key in ("message", "msg", "text", "body", "log", "event", "description", "detail"):
-        if key in obj:
-            message = str(obj[key])
-            break
-    if not message:
-        message = str(obj)
-
-    # Source / logger name
-    source = None
-    for key in ("logger", "source", "service", "module", "name", "component", "app"):
-        if key in obj:
-            source = str(obj[key])
-            break
-
-    # Everything else goes into extra
-    known_keys = {"timestamp", "time", "ts", "@timestamp", "datetime", "date", "created_at",
-                  "level", "severity", "log_level", "lvl", "type",
-                  "message", "msg", "text", "body", "log", "event", "description", "detail",
-                  "logger", "source", "service", "module", "name", "component", "app", "status"}
-    extra = {k: v for k, v in obj.items() if k not in known_keys}
-
-    return LogEntry(timestamp=ts, level=level, message=message, source=source, extra=extra, raw=json.dumps(obj))
-
-
-def parse_line(line: str, raw: str) -> LogEntry:
-    """Parse a single plain-text log line using regex heuristics."""
-    ts = None
-    ts_str = None
+    # ── Plain text ──
+    ts, ts_str = None, None
     for pattern in TS_PATTERNS:
         m = re.search(pattern, line)
         if m:
-            ts_str = m.group(1)
-            ts = parse_timestamp(ts_str)
+            ts = parse_timestamp(m.group(1))
             if ts:
+                ts_str = m.group(1)
                 break
 
-    level = "INFO"
-    level_match = LEVEL_PATTERN.search(line)
-    if level_match:
-        level = level_match.group(1).upper()
+    level_m = LEVEL_RE.search(line)
+    level = level_m.group(1).upper() if level_m else "INFO"
 
     working = line
     if ts_str:
         working = working.replace(ts_str, "", 1).strip()
 
-    bracketed = re.findall(r"\[([^\]]+)\]", working)
     source = None
-    for token in bracketed:
+    for token in re.findall(r"\[([^\]]+)\]", working):
         token = token.strip()
-        if LEVEL_PATTERN.fullmatch(token):
-            continue
-        if not re.match(r"^\d+$", token):
+        if not LEVEL_RE.fullmatch(token) and not re.match(r"^\d+$", token):
             source = token
             break
 
     message = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", working).strip()
-    message = re.sub(r"^[\s|:,\-–]+", "", message).strip()
-    if not message:
-        message = working
+    message = re.sub(r"^[\s|:,\-–]+", "", message).strip() or working
 
-    return LogEntry(timestamp=ts, level=level, message=message, source=source, raw=raw)
+    return dict(ts=ts, level=level, message=message, source=source, extra={})
 
 
-def parse_mixed_log(content: str) -> list[LogEntry]:
-    """Parse a file where each line can be JSON or plain text."""
+def parse_file(path):
     entries = []
-    for line in content.splitlines():
-        raw = line
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("{"):
-            try:
-                obj = json.loads(stripped)
-                entries.append(_json_obj_to_entry(obj))
-                continue
-            except json.JSONDecodeError:
-                pass
-        entries.append(parse_line(stripped, raw))
+    for raw in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        if raw.strip():
+            entries.append(parse_line(raw))
     return entries
 
 
-def parse_text_line(line: str, raw: str) -> LogEntry:
-    """Parse a single plain-text log line."""
-    ts = None
-    ts_str = None
-    for pattern in TS_PATTERNS:
-        m = re.search(pattern, line)
-        if m:
-            ts_str = m.group(1)
-            ts = parse_timestamp(ts_str)
-            if ts:
-                break
+# ── Filtering ─────────────────────────────────────────────────────────────────
 
-    level = "INFO"
-    level_match = LEVEL_PATTERN.search(line)
-    if level_match:
-        level = level_match.group(1).upper()
+LEVEL_ORDER = ["TRACE","DEBUG","INFO","NOTICE","WARN","WARNING","ERROR","CRITICAL","FATAL","SEVERE"]
 
-    working = line
-    if ts_str:
-        working = working.replace(ts_str, "", 1).strip()
+def above_level(entry_level, min_level):
+    try:
+        return LEVEL_ORDER.index(entry_level) >= LEVEL_ORDER.index(min_level.upper())
+    except ValueError:
+        return entry_level == min_level.upper()
 
-    bracketed = re.findall(r"\[([^\]]+)\]", working)
-    source = None
-    for token in bracketed:
-        token = token.strip()
-        if LEVEL_PATTERN.fullmatch(token):
-            continue
-        if not re.match(r"^\d+$", token):
-            source = token
-            break
-
-    message = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", working).strip()
-    message = re.sub(r"^[\s|:,\-–]+", "", message).strip()
-    if not message:
-        message = working
-
-    return LogEntry(timestamp=ts, level=level, message=message, source=source, raw=raw)
-
-
-def parse_file(path: Path) -> list[LogEntry]:
-    """Read the file and parse each line individually as JSON or plain text."""
-    content = path.read_text(encoding="utf-8", errors="replace")
-
-    # Pure .json file — handle as a whole (array or NDJSON)
-    if path.suffix.lower() == ".json":
-        return parse_json_log(content)
-
-    # Everything else: decide per line
-    entries = []
-    for line in content.splitlines():
-        raw = line
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("{"):
-            try:
-                obj = json.loads(stripped)
-                entries.append(_json_obj_to_entry(obj))
-                continue
-            except json.JSONDecodeError:
-                pass  # not valid JSON — fall through to text parser
-        entries.append(parse_text_line(stripped, raw))
-
-    return entries
-
-
-# ── Formatter ─────────────────────────────────────────────────────────────────
-
-COL_WIDTHS = {"timestamp": 19, "level": 8, "source": 20}
-SEPARATOR = c("─" * 100, "dim")
-
-
-def format_level_badge(level: str) -> str:
-    color = LEVEL_COLORS.get(level, "white")
-    padded = level[:8].center(8)
-    return c(f"[{padded}]", color, "bold")
-
-
-def format_timestamp(ts: datetime | None) -> str:
+def in_time_range(ts, since, until):
     if ts is None:
-        return c("─" * 19, "dim")
-    formatted = ts.strftime("%Y-%m-%d %H:%M:%S")
-    return c(formatted, "cyan")
+        return True
+    if since and ts < since:
+        return False
+    if until and ts > until:
+        return False
+    return True
 
 
-def format_source(source: str | None) -> str:
-    if not source:
-        return c("─" * COL_WIDTHS["source"], "dim")
-    trimmed = source[:COL_WIDTHS["source"]].ljust(COL_WIDTHS["source"])
-    return c(trimmed, "magenta")
+# ── Formatting ────────────────────────────────────────────────────────────────
 
+SEP = c("─" * 100, "dim")
 
-def format_message(message: str, level: str) -> str:
-    color = LEVEL_COLORS.get(level, "white")
-    if level in ("ERROR", "CRITICAL", "FATAL"):
-        return c(message, color, "bold")
-    if level in ("WARN", "WARNING"):
-        return c(message, color)
-    return message
-
-
-def format_entry(entry: LogEntry, show_extra: bool = True) -> str:
-    ts = format_timestamp(entry.timestamp)
-    badge = format_level_badge(entry.level)
-    src = format_source(entry.source)
-    msg = format_message(entry.message, entry.level)
+def format_entry(e):
+    ts  = c(e["ts"].strftime("%Y-%m-%d %H:%M:%S"), "cyan") if e["ts"] else c("─" * 19, "dim")
+    lvl = e["level"][:8].center(8)
+    badge = c(f"[{lvl}]", LEVEL_COLORS.get(e["level"], "white"), "bold")
+    src = c((e["source"] or "")[:20].ljust(20), "magenta") if e["source"] else c("─" * 20, "dim")
+    msg = e["message"]
+    if e["level"] in ("ERROR","CRITICAL","FATAL"):
+        msg = c(msg, "red", "bold")
+    elif e["level"] in ("WARN","WARNING"):
+        msg = c(msg, "yellow")
 
     line = f"  {ts}  {badge}  {src}  {msg}"
 
-    if show_extra and entry.extra:
-        extras = []
-        for k, v in entry.extra.items():
-            val = json.dumps(v) if not isinstance(v, str) else v
-            extras.append(c(f"{k}", "gray") + c("=", "dim") + c(val, "dim"))
-        line += "\n" + " " * 56 + "  " + "  ".join(extras)
+    if e["extra"]:
+        pairs = "  ".join(
+            c(k, "gray") + c("=", "dim") + c(json.dumps(v) if not isinstance(v, str) else v, "dim")
+            for k, v in e["extra"].items()
+        )
+        line += "\n" + " " * 58 + pairs
 
     return line
 
 
-def print_header(path: Path, total: int, filtered: int):
-    title = c(f" LOG PARSER ", "bold", "white")
-    file_info = c(str(path), "cyan")
-    count_info = c(f"{filtered}", "green", "bold") + c(f" / {total} entries", "gray")
-
+def print_header(path, total, shown):
     print()
     print(c("╔" + "═" * 98 + "╗", "dim"))
-    print(c("║", "dim") + f"  {title}  {file_info}  →  {count_info}" + c("  ║", "dim"))
+    print(c("║", "dim") +
+          f"  {c(' LOG PARSER ', 'bold', 'white')}  {c(str(path), 'cyan')}  →  "
+          f"{c(str(shown), 'green', 'bold')}{c(f' / {total} entries', 'gray')}"
+          + c("  ║", "dim"))
     print(c("╚" + "═" * 98 + "╝", "dim"))
     print()
-
-    header = (
-        f"  {'TIMESTAMP':<19}  {'LEVEL':^10}  {'SOURCE':<20}  MESSAGE"
-    )
-    print(c(header, "bold", "white"))
-    print(SEPARATOR)
+    print(c(f"  {'TIMESTAMP':<19}  {'LEVEL':^10}  {'SOURCE':<20}  MESSAGE", "bold", "white"))
+    print(SEP)
 
 
-def print_summary(entries: list[LogEntry], filtered: list[LogEntry]):
-    level_counts = Counter(e.level for e in filtered)
+def print_summary(all_entries, filtered):
+    counts = Counter(e["level"] for e in filtered)
+    ts_list = [e["ts"] for e in filtered if e["ts"]]
     print()
-    print(SEPARATOR)
+    print(SEP)
     print()
     print(c("  SUMMARY", "bold", "white"))
     print()
-
-    total_filtered = len(filtered)
-    total_all = len(entries)
-    print(f"  Entries shown : {c(str(total_filtered), 'green', 'bold')}  {c(f'(of {total_all} total)', 'gray')}")
-
-    if level_counts:
-        print(f"  By level      :", end="")
-        parts = []
-        for level in ["FATAL", "CRITICAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE"]:
-            if level in level_counts:
-                color = LEVEL_COLORS.get(level, "white")
-                parts.append(c(f"{level}: {level_counts[level]}", color))
-        print("  " + "  |  ".join(parts))
-
-    ts_list = [e.timestamp for e in filtered if e.timestamp]
+    print(f"  Entries shown : {c(str(len(filtered)), 'green', 'bold')}  {c(f'(of {len(all_entries)} total)', 'gray')}")
+    if counts:
+        parts = [c(f"{lvl}: {counts[lvl]}", LEVEL_COLORS.get(lvl, "white"))
+                 for lvl in LEVEL_ORDER if lvl in counts]
+        print(f"  By level      :  {'  |  '.join(parts)}")
     if ts_list:
-        earliest = min(ts_list).strftime("%Y-%m-%d %H:%M:%S")
-        latest = max(ts_list).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  Time range    :  {c(earliest, 'cyan')}  →  {c(latest, 'cyan')}")
-
+        print(f"  Time range    :  {c(min(ts_list).strftime('%Y-%m-%d %H:%M:%S'), 'cyan')}"
+              f"  →  {c(max(ts_list).strftime('%Y-%m-%d %H:%M:%S'), 'cyan')}")
     print()
 
 
@@ -438,75 +224,43 @@ def print_summary(entries: list[LogEntry], filtered: list[LogEntry]):
 def main():
     global USE_COLOR
 
-    parser = argparse.ArgumentParser(
-        description="Parse and format JSON and plain-text log files.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("file", help="Path to the log file (.json, .log, .txt)")
-    parser.add_argument("--level", help="Minimum log level to show (DEBUG/INFO/WARN/ERROR)")
-    parser.add_argument("--since", help='Show entries after this time, e.g. "2024-01-15 10:00:00"')
-    parser.add_argument("--until", help='Show entries before this time, e.g. "2024-01-15 18:00:00"')
-    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
-    parser.add_argument("--summary", action="store_true", help="Show only the summary")
-    parser.add_argument("--output", help="Write formatted output to this file (implies --no-color)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Parse and format mixed JSON/text log files.")
+    ap.add_argument("file", help="Path to the log file")
+    ap.add_argument("--level", help="Minimum log level (DEBUG/INFO/WARN/ERROR)")
+    ap.add_argument("--since", help='Show entries after this time e.g. "2024-01-15 10:00:00"')
+    ap.add_argument("--until", help='Show entries before this time e.g. "2024-01-15 18:00:00"')
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--summary", action="store_true", help="Show only the summary")
+    args = ap.parse_args()
 
-    # Setup color
-    if args.no_color or args.output or not sys.stdout.isatty():
+    if args.no_color or not sys.stdout.isatty():
         USE_COLOR = False
 
-    # Parse time filters
-    since = parse_timestamp(args.since) if args.since else None
-    until = parse_timestamp(args.until) if args.until else None
-    if args.since and since is None:
-        print(f"Warning: could not parse --since value: {args.since!r}", file=sys.stderr)
-    if args.until and until is None:
-        print(f"Warning: could not parse --until value: {args.until!r}", file=sys.stderr)
-
-    # Load file
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file not found: {path}", file=sys.stderr)
         sys.exit(1)
 
+    since = parse_timestamp(args.since) if args.since else None
+    until = parse_timestamp(args.until) if args.until else None
+
     all_entries = parse_file(path)
 
-    # Apply filters
-    filtered = all_entries
-    if args.level:
-        filtered = [e for e in filtered if e.matches_level(args.level)]
-    filtered = [e for e in filtered if e.matches_time(since, until)]
+    filtered = [
+        e for e in all_entries
+        if (not args.level or above_level(e["level"], args.level))
+        and in_time_range(e["ts"], since, until)
+    ]
 
-    # Output destination
-    out = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
+    print_header(path, len(all_entries), len(filtered))
 
-    try:
-        # Redirect print to file if needed
-        if args.output:
-            import builtins
-            _orig_print = builtins.print
-            def _file_print(*a, **kw):
-                kw.setdefault("file", out)
-                _orig_print(*a, **kw)
-            builtins.print = _file_print
+    if not args.summary:
+        for e in filtered:
+            print(format_entry(e))
+        if not filtered:
+            print(c("  (no entries match the current filters)", "dim"))
 
-        print_header(path, len(all_entries), len(filtered))
-
-        if not args.summary:
-            for entry in filtered:
-                print(format_entry(entry))
-            if not filtered:
-                print(c("  (no entries match the current filters)", "dim"))
-
-        print_summary(all_entries, filtered)
-
-    finally:
-        if args.output:
-            import builtins
-            builtins.print = _orig_print
-            out.close()
-            print(f"Output written to: {args.output}", file=sys.stderr)
+    print_summary(all_entries, filtered)
 
 
 if __name__ == "__main__":
